@@ -5,7 +5,6 @@ namespace jit {
 namespace tensorexpr {
 
 constexpr auto cpp_intrinsics_definition = R"(
-
 namespace std {
 
 template <typename T,
@@ -22,7 +21,6 @@ T frac(T v) {
 }
 
 } // namespace std
-
 )";
 
 } // namespace tensorexpr

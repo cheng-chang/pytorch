@@ -1,6 +1,8 @@
+#include <algorithm>
 #include <type_traits>
 
 #include <torch/csrc/jit/tensorexpr/cpp_codegen.h>
+#include <torch/csrc/jit/tensorexpr/cpp_intrinsics.h>
 #include <torch/csrc/jit/tensorexpr/cpp_tensor.h>
 #include <torch/csrc/jit/tensorexpr/cpp_vector.h>
 #include <torch/csrc/jit/tensorexpr/external_functions_registry.h>
@@ -9,6 +11,76 @@
 namespace torch {
 namespace jit {
 namespace tensorexpr {
+
+const Expr* CppVarNameRewriter::mutate(const Var* v) {
+  constexpr char kDot = '.';
+  constexpr char kUnderscore = '_';
+  if (v->name_hint().find(kDot) == std::string::npos) {
+    return v;
+  }
+  std::string name = v->name_hint();
+  std::replace(name.begin(), name.end(), kDot, kUnderscore);
+  const Var* new_v = new Var(name, v->dtype());
+  old_to_new_var_[v] = new_v;
+  return static_cast<const Expr*>(new_v);
+}
+
+const Expr* CppVarNameRewriter::mutate(const Buf* v) {
+  const Var* var = v->base_handle();
+  const Var* var_new = static_cast<const Var*>(var->accept_mutator(this));
+  if (var_new == var) {
+    return v;
+  }
+  return new Buf(var_new, v->dims(), v->dtype(), v->initializer());
+}
+
+void CppPrinter::printPrologue() {
+  os() << "#include <cassert>" << std::endl;
+  os() << "#include <cmath>" << std::endl;
+  os() << "#include <vector>" << std::endl;
+  os() << "#include <algorithm>" << std::endl;
+  os() << "#include <type_traits>" << std::endl;
+  os() << std::endl;
+
+  os() << "#define POS_INFINITY INFINITY" << std::endl;
+  os() << "#define NEG_INFINITY -INFINITY" << std::endl;
+  os() << std::endl;
+
+  os() << cpp_vector_definition << std::endl;
+  os() << std::endl;
+
+  os() << cpp_tensor_definition << std::endl;
+  os() << std::endl;
+
+  os() << cpp_intrinsics_definition << std::endl;
+  os() << std::endl;
+
+  os() << "namespace torch {" << std::endl;
+  os() << "namespace jit {" << std::endl;
+  os() << "namespace tensorexpr {" << std::endl;
+  for (auto const& it : getNNCFunctionRegistry()) {
+    os() << declareExternalFunction(it.first) << std::endl;
+  }
+  os() << "} // namespace tensorexpr" << std::endl;
+  os() << "} // namespace jit" << std::endl;
+  os() << "} // namespace torch" << std::endl;
+  os() << std::endl;
+
+  os() << "using namespace torch::jit::tensorexpr;" << std::endl;
+  os() << std::endl;
+}
+
+std::string CppPrinter::declareExternalFunction(const std::string& func_name) {
+  return "void " + func_name +
+      "("
+      "int64_t bufs_num, "
+      "void** buf_data, "
+      "int64_t* buf_ranks, "
+      "int64_t* buf_dims, "
+      "int8_t* buf_dtypes, "
+      "int64_t args_num, "
+      "int64_t* extra_args);";
+}
 
 void CppPrinter::visit(const Ramp* v) {
   const IntImm* base = dynamic_cast<const IntImm*>(v->base());
@@ -127,7 +199,7 @@ void CppPrinter::visit(const Min* v) {
   }
 }
 
-std::string CppPrinter::to_lambda(
+std::string CppPrinter::toLambda(
     CompareSelectOperation op,
     const std::string& ty) {
   std::stringstream ss;
@@ -146,7 +218,7 @@ void CppPrinter::visit(const CompareSelect* v) {
     std::string input_ty = v->lhs()->dtype().ToCppString();
     std::string return_ty = v->ret_val1()->dtype().ToCppString();
     os() << "CompareSelect<" << input_ty << ", " << return_ty << ">("
-         << to_lambda(v->compare_select_op(), input_ty) << ", " << *v->lhs()
+         << toLambda(v->compare_select_op(), input_ty) << ", " << *v->lhs()
          << ", " << *v->rhs() << ", " << *v->ret_val1() << ", "
          << *v->ret_val2() << ")";
   }
@@ -291,7 +363,7 @@ void CppPrinter::visit(const ExternalCall* v) {
 
   emitIndent();
   os() << "std::vector<void*> buf_ptrs{";
-  for_buf([&](const Buf* b) { os() << "&" << *b->base_handle(); });
+  for_buf([&](const Buf* b) { os() << *b->base_handle() << ".data()"; });
   os() << "};" << std::endl;
 
   emitIndent();
@@ -347,8 +419,43 @@ void CppPrinter::visit(const ExternalCall* v) {
 
   indent_--;
   emitIndent();
-  os() << "}";
+  os() << "}" << std::endl;
 }
+
+void CppCodeGen::init() {
+  printer_ = std::make_unique<CppPrinter>(&oss_);
+  var_name_rewriter_ = std::make_unique<CppVarNameRewriter>();
+
+  apply_mutator(var_name_rewriter_.get());
+
+  printer_->printPrologue();
+  os() << "void " << kernel_func_name() << "(";
+  const std::vector<BufferArg> buffer_args = this->buffer_args();
+  for (size_t i = 0; i < buffer_args.size(); i++) {
+    if (i > 0) {
+      os() << ", ";
+    }
+    const BufferArg& buffer_arg = buffer_args[i];
+    const Var* var = var_name_rewriter_->getNewVar(buffer_arg.var());
+    Dtype dtype = buffer_arg.dtype();
+    if (buffer_arg.isVar()) {
+      os() << dtype.ToCppString() << " " << *var;
+    } else {
+      os() << "Tensor<" << dtype.ToCppString() << ">& " << *var;
+    }
+  }
+  os() << ")";
+  stmt()->accept(printer_.get());
+  os() << std::endl;
+}
+
+void CppCodeGen::call(const std::vector<CallArg>& args) {
+  // TODO: compile the generated C++ kernel into a library,
+  // and call the library here.
+  os() << "int main() {}" << std::endl;
+}
+
+RegisterCodeGen<CppCodeGen> cpp_codegen_reg("cpp_codegen");
 
 } // namespace tensorexpr
 } // namespace jit

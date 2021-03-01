@@ -6,7 +6,6 @@ namespace tensorexpr {
 
 // TODO: use SIMD such as AVX
 constexpr auto cpp_vector_definition = R"(
-
 template <typename T>
 class Vector {
  public:
@@ -42,22 +41,23 @@ class DenseVector : public Vector<T> {
 
 class Ramp : public Vector<int> {
  public:
-  Ramp(int base, int stride, int lanes)
-      : base_(base), stride_(stride), lanes_(lanes) {}
+  Ramp(int base, int stride, int lanes) : v_(lanes, 0) {
+    v_[0] = base;
+    for (int i = 1; i < lanes; i++) {
+      v_[i] = v_[i-1] + stride;
+    }
+  }
 
   size_t len() const override {
-    return static_cast<size_t>(lanes_);
+    return v_.size();
   }
 
   const int& operator[](size_t idx) const override {
-    assert(idx >= 0 && idx < static_cast<size_t>(lanes_));
-    return base_ + stride_ * static_cast<int>(idx);
+    return v_.at(idx);
   }
 
  private:
-  int base_;
-  int stride_;
-  int lanes_;
+  std::vector<int> v_;
 };
 
 template <typename T>
@@ -81,7 +81,7 @@ class Broadcast : public Vector<T> {
 
 template <typename TInput, typename TReturn>
 Vector<TReturn> vectorizedUnaryOp(const Vector<TInput>& v,
-    std::function<TReturn(TInput)> unary_op) const {
+    std::function<TReturn(TInput)> unary_op) {
   DenseVector<TReturn> res(v.len());
   for (size_t i = 0; i < v.len(); i++) {
     res[i] = unary_op(v[i]);
@@ -91,7 +91,7 @@ Vector<TReturn> vectorizedUnaryOp(const Vector<TInput>& v,
 
 template <typename TInput, typename TReturn>
 Vector<TReturn> vectorizedBinaryOp(const Vector<TInput>& a, const Vector<TInput>& b,
-    std::function<TReturn(TInput, TInput)> binary_op) const {
+    std::function<TReturn(TInput, TInput)> binary_op) {
   assert(a.len() == b.len());
   DenseVector<TReturn> res(a.len());
   for (size_t i = 0; i < a.len(); i++) {
@@ -101,27 +101,27 @@ Vector<TReturn> vectorizedBinaryOp(const Vector<TInput>& a, const Vector<TInput>
 }
 
 template <typename T>
-Vector<T> operator+(const Vector<T>& lhs, const Vector<T>& rhs) const {
+Vector<T> operator+(const Vector<T>& lhs, const Vector<T>& rhs) {
   return vectorizedBinaryOp<T, T>(lhs, rhs, [](T a, T b) { return a + b; });
 }
 
 template <typename T>
-Vector<T> operator-(const Vector<T>& lhs, const Vector<T>& rhs) const {
+Vector<T> operator-(const Vector<T>& lhs, const Vector<T>& rhs) {
   return vectorizedBinaryOp<T, T>(lhs, rhs, [](T a, T b) { return a - b; });
 }
 
 template <typename T>
-Vector<T> operator*(const Vector<T>& lhs, const Vector<T>& rhs) const {
+Vector<T> operator*(const Vector<T>& lhs, const Vector<T>& rhs) {
   return vectorizedBinaryOp<T, T>(lhs, rhs, [](T a, T b) { return a * b; });
 }
 
 template <typename T>
-Vector<T> operator/(const Vector<T>& lhs, const Vector<T>& rhs) const {
+Vector<T> operator/(const Vector<T>& lhs, const Vector<T>& rhs) {
   return vectorizedBinaryOp<T, T>(lhs, rhs, [](T a, T b) { return a / b; });
 }
 
 template <typename T>
-Vector<T> operator%(const Vector<T>& lhs, const Vector<T>& rhs) const {
+Vector<T> operator%(const Vector<T>& lhs, const Vector<T>& rhs) {
   return vectorizedBinaryOp<T, T>(lhs, rhs, [](T a, T b) {
     if (std::is_floating_point<T>::value) {
       return std::fmod(a, b);
@@ -134,27 +134,27 @@ Vector<T> operator%(const Vector<T>& lhs, const Vector<T>& rhs) const {
 }
 
 template <typename T>
-Vector<T> operator&(const Vector<T>& lhs, const Vector<T>& rhs) const {
+Vector<T> operator&(const Vector<T>& lhs, const Vector<T>& rhs) {
   return vectorizedBinaryOp<T, T>(lhs, rhs, [](T a, T b) { return a & b; });
 }
 
 template <typename T>
-Vector<T> operator|(const Vector<T>& lhs, const Vector<T>& rhs) const {
+Vector<T> operator|(const Vector<T>& lhs, const Vector<T>& rhs) {
   return vectorizedBinaryOp<T, T>(lhs, rhs, [](T a, T b) { return a | b; });
 }
 
 template <typename T>
-Vector<T> operator^(const Vector<T>& lhs, const Vector<T>& rhs) const {
+Vector<T> operator^(const Vector<T>& lhs, const Vector<T>& rhs) {
   return vectorizedBinaryOp<T, T>(lhs, rhs, [](T a, T b) { return a ^ b; });
 }
 
 template <typename T>
-Vector<T> operator<<(const Vector<T>& lhs, const Vector<T>& rhs) const {
+Vector<T> operator<<(const Vector<T>& lhs, const Vector<T>& rhs) {
   return vectorizedBinaryOp<T, T>(lhs, rhs, [](T a, T b) { return a << b; });
 }
 
 template <typename T>
-Vector<T> operator>>(const Vector<T>& lhs, const Vector<T>& rhs) const {
+Vector<T> operator>>(const Vector<T>& lhs, const Vector<T>& rhs) {
   return vectorizedBinaryOp<T, T>(lhs, rhs, [](T a, T b) { return a >> b; });
 }
 
@@ -237,15 +237,14 @@ Vector<TReturn> CompareSelect(std::function<bool(TInput, TInput)> cmp,
 template <typename TInput, typename TReturn>
 Vector<TReturn> ComputeIntrinsics(std::function<TReturn(TInput)> intrinsics_func,
     const Vector<TInput>& vec) {
-  return vectorizedUnaryOp<TInput, TReturn>(vec, f);
+  return vectorizedUnaryOp<TInput, TReturn>(vec, intrinsics_func);
 }
 
 template <typename TInput, typename TReturn>
 Vector<TReturn> ComputeIntrinsics(std::function<TReturn(TInput, TInput)> intrinsics_func,
     const Vector<TInput>& vec1, const Vector<TInput>& vec2) {
-  return vectorizedBinaryOp<TInput, TReturn>(vec1, vec2, f);
+  return vectorizedBinaryOp<TInput, TReturn>(vec1, vec2, intrinsics_func);
 }
-
 )";
 
 } // namespace tensorexpr

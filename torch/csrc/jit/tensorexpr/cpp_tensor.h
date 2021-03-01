@@ -6,11 +6,10 @@ namespace tensorexpr {
 
 // TODO: use SIMD such as AVX
 constexpr auto cpp_tensor_definition = R"(
-
 template <typename T>
 class Tensor {
  public:
-  explicit Tensor(const std::array<int>& dims) : strides_(dims.size()) {
+  explicit Tensor(const std::vector<int>& dims) : strides_(dims.size()) {
     int size = sizeof(T);
     for (int dim : dims) {
       size *= dim;
@@ -20,7 +19,7 @@ class Tensor {
     int ndim = dims.size();
     strides_[ndim - 1] = 1;
     for (size_t i = ndim - 2; i >= 0; i--) {
-      strides_[i] = strides[i + 1] * dims[i + 1];
+      strides_[i] = strides_[i + 1] * dims[i + 1];
     }
   }
 
@@ -35,11 +34,19 @@ class Tensor {
     }
   }
 
-  const T& operator[](const std::array<int>& idx) const {
+  T& operator[](int idx) {
+    return storage_[idx];
+  }
+
+  const T& operator[](int idx) const {
+    return storage_[idx];
+  }
+
+  const T& operator[](const std::vector<int>& idx) const {
     return storage_[flatten_index(idx)];
   }
 
-  T& operator[](const std::array<int>& idx) {
+  T& operator[](const std::vector<int>& idx) {
     return storage_[flatten_index(idx)];
   }
 
@@ -66,11 +73,15 @@ class Tensor {
     }
   }
 
+  void* data() {
+    return static_cast<void*>(storage_);
+  }
+
  private:
   T* storage_;
-  std::array<int> strides_;
+  std::vector<int> strides_;
 
-  int flatten_index(const std::array<int>& idx) const {
+  int flatten_index(const std::vector<int>& idx) const {
     int flat_idx = 0;
     for (size_t i = 0; i < strides_.size(); i++) {
       flat_idx += idx[i] * strides_[i];
@@ -78,7 +89,6 @@ class Tensor {
     return flat_idx;
   }
 };
-
 )";
 
 } // namespace tensorexpr

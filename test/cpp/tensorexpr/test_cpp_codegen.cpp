@@ -383,7 +383,7 @@ TEST(CppPrinter, ExternalCall) {
       output, "nnc_aten_matmul", {buf_arg1, buf_arg2}, {scalar_arg});
   const std::string pattern = R"(
    # CHECK: {
-   # CHECK:   std::vector<void*> buf_ptrs{&out, &a, &b};
+   # CHECK:   std::vector<void*> buf_ptrs{out.data(), a.data(), b.data()};
    # CHECK:   std::vector<int64_t> buf_ranks{2, 2, 2};
    # CHECK:   std::vector<int64_t> buf_dims{2, 2, 2, 2, 2, 2};
    # CHECK:   std::vector<int8_t> buf_dtypes{6, 6, 6};
