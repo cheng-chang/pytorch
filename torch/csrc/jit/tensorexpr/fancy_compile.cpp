@@ -6,6 +6,7 @@
 #include <torch/csrc/jit/jit_opt_limit.h>
 #include <torch/csrc/jit/passes/constant_propagation.h>
 #include <torch/csrc/jit/passes/dead_code_elimination.h>
+#include <torch/csrc/jit/tensorexpr/cpp_codegen.h>
 #include <torch/csrc/jit/tensorexpr/ir.h>
 #include <torch/csrc/jit/tensorexpr/ir_simplifier.h>
 #include <torch/csrc/jit/tensorexpr/kernel.h>
@@ -181,10 +182,12 @@ class AOT_NNC_Compiler {
 
     std::cerr << "Prepared for codegen!\n";
     std::cerr << *l.root_stmt() << "\n";
-    //     codegen_ = CreateCodeGen("simple_ir_eval", l.root_stmt(), buf_args,
+    // codegen_ = CreateCodeGen("simple_ir_eval", l.root_stmt(), buf_args,
     //     c10::kCPU, "qqq");
-    codegen_ = CreateCodeGen(
-        "llvm_codegen", l.root_stmt(), buf_args, c10::kCPU, "qqq");
+    // codegen_ = CreateCodeGen(
+    //     "llvm_codegen", l.root_stmt(), buf_args, c10::kCPU, "qqq");
+    codegen_ =
+        CreateCodeGen("cpp_codegen", l.root_stmt(), buf_args, c10::kCPU, "qqq");
     std::cerr << "Codegen created!\n";
 
     call_args.emplace_back(nullptr);
@@ -205,6 +208,14 @@ class AOT_NNC_Compiler {
 
     original_graph->eraseInput(0);
     optimized_graph->eraseInput(0);
+  }
+
+  void compile_to_cpp(at::Tensor x) {
+    std::cerr << "C++ codegen:" << std::endl;
+    call_args[0] = x.data_ptr();
+    call_args[1] = output_data;
+    codegen_->call(call_args);
+    std::cerr << codegen_->getCodeText() << std::endl;
   }
 
   at::Tensor call_with_nnc(at::Tensor x) {
@@ -982,10 +993,11 @@ void fancy_compile(std::shared_ptr<Graph>& g, const std::vector<int>& sizes) {
 
   AOT_NNC_Compiler aot(g);
   aot.compile_for_sizes(sizes);
-  //   at::Tensor input_tensor = at::ones({1, 3, 224, 224});
-  at::Tensor input_tensor = at::randn({1, 3, 224, 224}) * 1000.0;
-  auto a = aot.call_with_nnc(input_tensor);
-  auto b = aot.call_with_jit_optimized_graph(input_tensor);
+  at::Tensor input_tensor = at::ones({1, 3, 224, 224});
+  // at::Tensor input_tensor = at::randn({1, 3, 224, 224}) * 1000.0;
+  // auto a = aot.call_with_nnc(input_tensor);
+  // auto b = aot.call_with_jit_optimized_graph(input_tensor);
+  aot.compile_to_cpp(input_tensor);
 }
 
 } // namespace tensorexpr
