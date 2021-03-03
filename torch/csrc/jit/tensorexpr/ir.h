@@ -239,7 +239,7 @@ class Max : public BinaryOpNode<Max> {
   bool propagate_nans_;
 
  public:
-  Max(const Expr* lhs, const Expr* rhs, bool propagate_nans)
+  Max(const Expr* lhs, const Expr* rhs, bool propagate_nans = false)
       : BinaryOpNode(lhs, rhs, IRNodeType::kMax),
         propagate_nans_(propagate_nans) {}
 
@@ -261,7 +261,7 @@ class Min : public BinaryOpNode<Min> {
   bool propagate_nans_;
 
  public:
-  Min(const Expr* lhs, const Expr* rhs, bool propagate_nans)
+  Min(const Expr* lhs, const Expr* rhs, bool propagate_nans = false)
       : BinaryOpNode(lhs, rhs, IRNodeType::kMin),
         propagate_nans_(propagate_nans) {}
 

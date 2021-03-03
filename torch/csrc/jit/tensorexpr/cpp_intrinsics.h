@@ -20,6 +20,14 @@ T frac(T v) {
   return std::modf(v, &intpart);
 }
 
+template <typename From, typename To>
+To bitcast(const From& v) {
+  assert(sizeof(To) == sizeof(From));
+  To res;
+  std::memcpy(&res, &v, sizeof(From));
+  return res;
+}
+
 } // namespace std
 )";
 

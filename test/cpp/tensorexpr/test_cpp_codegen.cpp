@@ -59,33 +59,10 @@ TEST(CppPrinter, HalfImm) {
   STR_CHECK(h, "10");
 }
 
-TEST(CppPrinter, Ramp) {
-  KernelScope kernel_scope;
-  auto base = new IntImm(0);
-  auto stride = new IntImm(2);
-  int lanes = 4;
-  auto ramp = new Ramp(base, stride, lanes);
-  STR_CHECK(ramp, "Ramp(0, 2, 4)");
-}
-
-TEST(CppPrinter, Broadcast) {
-  KernelScope kernel_scope;
-  auto bcast = new Broadcast(new HalfImm(1), 3);
-  STR_CHECK(bcast, "Broadcast<half>(1, 3)");
-}
-
 TEST(CppPrinter, Add) {
   KernelScope kernel_scope;
   auto add = new Add(new IntImm(1), new IntImm(2));
   STR_CHECK(add, "1 + 2");
-}
-
-TEST(CppPrinter, AddVec) {
-  KernelScope kernel_scope;
-  auto vec1 = new Ramp(new IntImm(0), new IntImm(1), 3);
-  auto vec2 = new Broadcast(new IntImm(2), 3);
-  auto add = new Add(vec1, vec2);
-  STR_CHECK(add, "(Ramp(0, 1, 3)) + (Broadcast<int>(2, 3))");
 }
 
 TEST(CppPrinter, AddExpr1) {
@@ -124,14 +101,6 @@ TEST(CppPrinter, ModFloat) {
   STR_CHECK(mod, "std::fmod(1.f, 2.f)");
 }
 
-TEST(CppPrinter, ModVec) {
-  KernelScope kernel_scope;
-  auto vec1 = new Ramp(new IntImm(0), new IntImm(1), 3);
-  auto vec2 = new Broadcast(new IntImm(2), 3);
-  auto mod = new Mod(vec1, vec2);
-  STR_CHECK(mod, "Ramp(0, 1, 3) % Broadcast<int>(2, 3)");
-}
-
 TEST(CppPrinter, Max) {
   KernelScope kernel_scope;
   auto max = new Max(new IntImm(1), new IntImm(2), false);
@@ -150,26 +119,10 @@ TEST(CppPrinter, MaxHalf) {
   STR_CHECK(max, "(1 < 2) ? 2 : 1");
 }
 
-TEST(CppPrinter, MaxVec) {
-  KernelScope kernel_scope;
-  auto vec1 = new Ramp(new IntImm(0), new IntImm(1), 3);
-  auto vec2 = new Broadcast(new IntImm(2), 3);
-  auto max = new Max(vec1, vec2, false);
-  STR_CHECK(max, "Max(Ramp(0, 1, 3), Broadcast<int>(2, 3))");
-}
-
 TEST(CppPrinter, And) {
   KernelScope kernel_scope;
   auto v = new And(new IntImm(1), new IntImm(2));
   STR_CHECK(v, "1 & 2");
-}
-
-TEST(CppPrinter, AndVec) {
-  KernelScope kernel_scope;
-  auto vec1 = new Ramp(new IntImm(0), new IntImm(1), 3);
-  auto vec2 = new Broadcast(new IntImm(2), 3);
-  auto v = new And(vec1, vec2);
-  STR_CHECK(v, "(Ramp(0, 1, 3)) & (Broadcast<int>(2, 3))");
 }
 
 TEST(CppPrinter, CompareSelect) {
@@ -183,26 +136,13 @@ TEST(CppPrinter, CompareSelect) {
   STR_CHECK(cs, "((1 <= 2) ? 1.f : 2.f)");
 }
 
-TEST(CppPrinter, CompareSelectVec) {
-  KernelScope kernel_scope;
-  auto vec1 = new Ramp(new IntImm(0), new IntImm(1), 3);
-  auto vec2 = new Broadcast(new IntImm(2), 3);
-  auto cs =
-      new CompareSelect(vec1, vec2, vec1, vec2, CompareSelectOperation::kGT);
-  STR_CHECK(
-      cs,
-      "CompareSelect<int, int>([](int lhs, int rhs) { return lhs > rhs; }, "
-      "Ramp(0, 1, 3), Broadcast<int>(2, 3), "
-      "Ramp(0, 1, 3), Broadcast<int>(2, 3))");
-}
-
 TEST(CppPrinter, IfThenElse) {
   KernelScope kernel_scope;
   auto cond = new Add(new IntImm(1), new IntImm(2));
-  auto true_value = new Ramp(new IntImm(0), new IntImm(1), 3);
-  auto false_value = new Broadcast(new IntImm(2), 3);
+  auto true_value = new Sub(new IntImm(0), new IntImm(1));
+  auto false_value = new Mul(new IntImm(2), new IntImm(3));
   auto v = new IfThenElse(cond, true_value, false_value);
-  STR_CHECK(v, "((1 + 2) ? Ramp(0, 1, 3) : Broadcast<int>(2, 3))");
+  STR_CHECK(v, "((1 + 2) ? 0 - 1 : 2 * 3)");
 }
 
 TEST(CppPrinter, AllocateFree) {
@@ -214,8 +154,8 @@ TEST(CppPrinter, AllocateFree) {
 
   const std::string pattern = R"(
    # CHECK: {
-   # CHECK:   Tensor<int> x({2, 3});
-   # CHECK:   x.free();
+   # CHECK:   int* x = static_cast<int*>(malloc(24));
+   # CHECK:   free(x);
    # CHECK: }
   )";
   FILE_CHECK(block, pattern);
@@ -225,24 +165,9 @@ TEST(CppPrinter, LoadStore) {
   KernelScope kernel_scope;
   Placeholder a(BufHandle("A", {2, 3}, kInt));
   Placeholder b(BufHandle("B", {3, 4}, kInt));
-  auto store = b.store({1, 1}, a.load(2, 2));
-  STR_CHECK(store, "B[{1, 1}] = A[{2, 2}];\n");
-}
-
-TEST(CppPrinter, LoadStoreVec) {
-  KernelScope kernel_scope;
-  Placeholder a(BufHandle("A", {3}, kInt));
-  Placeholder b(BufHandle("B", {3}, kInt));
-  auto store = b.storeWithMask(
-      {Ramp::make(0, 1, 3)},
-      a.loadWithMask(
-          {Ramp::make(0, 1, 3)}, Broadcast::make(IntImm::make(1), 3)),
-      Broadcast::make(IntImm::make(1), 3));
+  auto store = b.store({2, 2}, a.load(1, 1));
   STR_CHECK(
-      store,
-      "B.store(Ramp(0, 1, 3), "
-      "A.load(Ramp(0, 1, 3), Broadcast<int>(1, 3)), "
-      "Broadcast<int>(1, 3));\n");
+      store, "B[(0 + 2 * (1 * 4)) + 2 * 1] = A[(0 + 1 * (1 * 3)) + 1 * 1];\n");
 }
 
 TEST(CppPrinter, Var) {
@@ -257,23 +182,10 @@ TEST(CppPrinter, Cast) {
   STR_CHECK(cast, "static_cast<float>(1)");
 }
 
-TEST(CppPrinter, CastVec) {
-  KernelScope kernel_scope;
-  auto cast = new Cast(kFloat, new Ramp(new IntImm(0), new IntImm(1), 2));
-  STR_CHECK(cast, "Cast<int, float>(Ramp(0, 1, 2))");
-}
-
 TEST(CppPrinter, BitCast) {
   KernelScope kernel_scope;
   auto cast = new BitCast(kInt, new FloatImm(20));
-  STR_CHECK(cast, "BitCast<float, int>(20.f)");
-}
-
-TEST(CppPrinter, BitCastVec) {
-  KernelScope kernel_scope;
-  auto cast =
-      new BitCast(Dtype(kFloat, 2), new Ramp(new IntImm(0), new IntImm(1), 2));
-  STR_CHECK(cast, "BitCast<int, float>(Ramp(0, 1, 2))");
+  STR_CHECK(cast, "std::bitcast<float, int>(20.f)");
 }
 
 TEST(CppPrinter, Let) {
@@ -327,48 +239,11 @@ TEST(CppPrinter, Intrinsics) {
     }
 
     if (Intrinsics::OpArgCount(op) == 1) {
-      {
-        auto v = new Intrinsics(op, new FloatImm(2.0f));
-        STR_CHECK(v, "std::" + v->func_name() + "(2.f)");
-      }
-
-      {
-        auto v = new Intrinsics(op, new Ramp(new IntImm(0), new IntImm(1), 3));
-        if (op == kIsNan) {
-          STR_CHECK(
-              v,
-              "ComputeIntrinsics<int, int>(std::" + v->func_name() +
-                  ", Ramp(0, 1, 3))");
-        } else {
-          STR_CHECK(
-              v,
-              "ComputeIntrinsics<int, double>(std::" + v->func_name() +
-                  ", Ramp(0, 1, 3))");
-        }
-      }
+      auto v = new Intrinsics(op, new FloatImm(2.0f));
+      STR_CHECK(v, "std::" + v->func_name() + "(2.f)");
     } else {
-      {
-        auto v = new Intrinsics(op, new FloatImm(1.0f), new FloatImm(2.0f));
-        STR_CHECK(v, "std::" + v->func_name() + "(1.f, 2.f)");
-      }
-
-      {
-        auto v = new Intrinsics(
-            op,
-            new Ramp(new IntImm(0), new IntImm(1), 3),
-            new Broadcast(new DoubleImm(1.1), 3));
-        if (op == kIsNan) {
-          STR_CHECK(
-              v,
-              "ComputeIntrinsics<double, int>(std::" + v->func_name() +
-                  ", Ramp(0, 1, 3), Broadcast<double>(1.1, 3))");
-        } else {
-          STR_CHECK(
-              v,
-              "ComputeIntrinsics<double, double>(std::" + v->func_name() +
-                  ", Ramp(0, 1, 3), Broadcast<double>(1.1, 3))");
-        }
-      }
+      auto v = new Intrinsics(op, new FloatImm(1.0f), new FloatImm(2.0f));
+      STR_CHECK(v, "std::" + v->func_name() + "(1.f, 2.f)");
     }
   }
 }
@@ -383,7 +258,7 @@ TEST(CppPrinter, ExternalCall) {
       output, "nnc_aten_matmul", {buf_arg1, buf_arg2}, {scalar_arg});
   const std::string pattern = R"(
    # CHECK: {
-   # CHECK:   std::vector<void*> buf_ptrs{out.data(), a.data(), b.data()};
+   # CHECK:   std::vector<void*> buf_ptrs{out, a, b};
    # CHECK:   std::vector<int64_t> buf_ranks{2, 2, 2};
    # CHECK:   std::vector<int64_t> buf_dims{2, 2, 2, 2, 2, 2};
    # CHECK:   std::vector<int8_t> buf_dtypes{6, 6, 6};
@@ -399,6 +274,23 @@ TEST(CppPrinter, ExternalCall) {
    # CHECK: }
   )";
   FILE_CHECK(call, pattern);
+}
+
+TEST(CppPrinter, LoadStoreVecWithMask) {
+  KernelScope kernel_scope;
+  Placeholder a(BufHandle("A", {3}, kInt));
+  Placeholder b(BufHandle("B", {3}, kInt));
+  auto store = b.storeWithMask(
+      {Ramp::make(0, 1, 3)},
+      a.loadWithMask(
+          {Ramp::make(0, 1, 3)}, Broadcast::make(IntImm::make(1), 3)),
+      Broadcast::make(IntImm::make(1), 3));
+  const std::string pattern = R"(
+   # CHECK: B[0 + 0 * 1] = A[0 + 0 * 1];
+   # CHECK: B[0 + 1 * 1] = A[0 + 1 * 1];
+   # CHECK: B[0 + 2 * 1] = A[0 + 2 * 1];
+  )";
+  FILE_CHECK(store, pattern);
 }
 
 } // namespace jit

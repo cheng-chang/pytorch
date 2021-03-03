@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <type_traits>
+#include <vector>
 
 #include <torch/csrc/jit/tensorexpr/cpp_codegen.h>
 #include <torch/csrc/jit/tensorexpr/cpp_intrinsics.h>
@@ -12,27 +13,264 @@ namespace torch {
 namespace jit {
 namespace tensorexpr {
 
-const Expr* CppVarNameRewriter::mutate(const Var* v) {
-  constexpr char kDot = '.';
-  constexpr char kUnderscore = '_';
-  if (v->name_hint().find(kDot) == std::string::npos) {
-    return v;
+// Rewrites the variables' name according to valid C++ naming convention.
+// E.g. in Graph IR, variable name may contain '.', in C++, they are replaced
+// with '_'.
+class CppVarNameRewriter : public IRMutator {
+ public:
+  const Expr* mutate(const Var* v) override {
+    constexpr char kDot = '.';
+    constexpr char kUnderscore = '_';
+    if (v->name_hint().find(kDot) == std::string::npos) {
+      return v;
+    }
+    std::string name = v->name_hint();
+    std::replace(name.begin(), name.end(), kDot, kUnderscore);
+    const Var* new_v = new Var(name, v->dtype());
+    old_to_new_var_[v] = new_v;
+    return static_cast<const Expr*>(new_v);
   }
-  std::string name = v->name_hint();
-  std::replace(name.begin(), name.end(), kDot, kUnderscore);
-  const Var* new_v = new Var(name, v->dtype());
-  old_to_new_var_[v] = new_v;
-  return static_cast<const Expr*>(new_v);
-}
 
-const Expr* CppVarNameRewriter::mutate(const Buf* v) {
-  const Var* var = v->base_handle();
-  const Var* var_new = static_cast<const Var*>(var->accept_mutator(this));
-  if (var_new == var) {
-    return v;
+  const Expr* mutate(const Buf* v) override {
+    const Var* var = v->base_handle();
+    const Var* var_new = static_cast<const Var*>(var->accept_mutator(this));
+    if (var_new == var) {
+      return v;
+    }
+    return new Buf(var_new, v->dims(), v->dtype(), v->initializer());
   }
-  return new Buf(var_new, v->dims(), v->dtype(), v->initializer());
-}
+
+  // After mutation of the TE IR tree, the old Vars may still
+  // exist in CodeGen's BufferArgs, this method can be used
+  // to map the old Var to the mutated new Var.
+  const Var* getNewVar(const Var* old) const {
+    if (old_to_new_var_.find(old) != old_to_new_var_.end()) {
+      return old_to_new_var_.at(old);
+    }
+    return old;
+  }
+
+ private:
+  std::unordered_map<const Var*, const Var*> old_to_new_var_;
+};
+
+class ExprVector : public Expr {
+ public:
+  explicit ExprVector(const std::vector<const Expr*>& exprs)
+      : Expr(exprs[0]->dtype()), exprs_(exprs) {}
+
+  size_t size() const {
+    return exprs_.size();
+  }
+
+  const Expr* operator[](size_t idx) const {
+    return exprs_[idx];
+  }
+
+  void accept(IRVisitor*) const override {}
+  const Expr* accept_mutator(IRMutator*) const override {
+    return nullptr;
+  }
+
+ private:
+  std::vector<const Expr*> exprs_;
+};
+
+class StmtVector : public Stmt {
+ public:
+  explicit StmtVector(const std::vector<const Stmt*>& stmts) : stmts_(stmts) {}
+
+  size_t size() const {
+    return stmts_.size();
+  }
+
+  const Stmt* operator[](size_t idx) const {
+    return stmts_[idx];
+  }
+
+  void accept(IRVisitor*) const override {}
+  Stmt* accept_mutator(IRMutator*) override {
+    return nullptr;
+  }
+
+ private:
+  std::vector<const Stmt*> stmts_;
+};
+
+// Unrolls vector expressions into a vector of scalar expressions.
+// For example:
+// Ramp(IntImm(0), IntImm(1), IntImm(3)) is unrolled into:
+// ExprVector({IntImm(0), Add(IntImm(0), IntImm(1)), Add(IntImm(0),
+// Mul(IntImm(2), IntImm(1)))}).
+class Devectorizer : public IRMutator {
+ public:
+#define DEVEC_BINARY_OP(Op)                   \
+  const Expr* mutate(const Op* v) override {  \
+    auto v1 = devec(v->lhs());                \
+    auto v2 = devec(v->rhs());                \
+    assert(v1->size() == v2->size());         \
+    std::vector<const Expr*> res(v1->size()); \
+    for (size_t i = 0; i < res.size(); i++) { \
+      res[i] = new Op((*v1)[i], (*v2)[i]);    \
+    }                                         \
+    return new ExprVector(res);               \
+  }
+  DEVEC_BINARY_OP(Add)
+  DEVEC_BINARY_OP(Sub)
+  DEVEC_BINARY_OP(Mul)
+  DEVEC_BINARY_OP(Div)
+  DEVEC_BINARY_OP(Mod)
+  DEVEC_BINARY_OP(Max)
+  DEVEC_BINARY_OP(Min)
+  DEVEC_BINARY_OP(And)
+  DEVEC_BINARY_OP(Or)
+  DEVEC_BINARY_OP(Xor)
+  DEVEC_BINARY_OP(Lshift)
+  DEVEC_BINARY_OP(Rshift)
+#undef DEVEC_BINARY_OP
+
+  const Expr* mutate(const CompareSelect* v) override {
+    auto lhs = devec(v->lhs());
+    auto rhs = devec(v->rhs());
+    auto t = devec(v->ret_val1());
+    auto f = devec(v->ret_val2());
+    assert(lhs->size() == rhs->size());
+    assert(t->size() == f->size());
+    assert(lhs->size() == t->size());
+    std::vector<const Expr*> res(lhs->size());
+    for (size_t i = 0; i < res.size(); i++) {
+      res[i] = new CompareSelect(
+          (*lhs)[i], (*rhs)[i], (*t)[i], (*f)[i], v->compare_select_op());
+    }
+    return new ExprVector(res);
+  }
+
+  const Expr* mutate(const IfThenElse* v) override {
+    auto t = devec(v->true_value());
+    auto f = devec(v->false_value());
+    std::vector<const Expr*> res(
+        static_cast<size_t>(v->true_value()->dtype().lanes()));
+    for (size_t i = 0; i < res.size(); i++) {
+      res[i] = new IfThenElse(v->condition(), (*t)[i], (*f)[i]);
+    }
+    return new ExprVector(res);
+  }
+
+  const Expr* mutate(const Cast* v) override {
+    auto src = devec(v->src_value());
+    std::vector<const Expr*> res(src->size());
+    for (size_t i = 0; i < res.size(); i++) {
+      res[i] = new Cast(v->dtype().scalar_dtype(), (*src)[i]);
+    }
+    return new ExprVector(res);
+  }
+
+  const Expr* mutate(const BitCast* v) override {
+    auto src = devec(v->src_value());
+    std::vector<const Expr*> res(src->size());
+    for (size_t i = 0; i < res.size(); i++) {
+      res[i] = new BitCast(v->dtype().scalar_dtype(), (*src)[i]);
+    }
+    return new ExprVector(res);
+  }
+
+  const Expr* mutate(const Ramp* v) override {
+    std::vector<const Expr*> res(v->lanes());
+    for (size_t i = 0; i < res.size(); i++) {
+      res[i] = new Add(v->base(), new Mul(new IntImm(i), v->stride()));
+    }
+    return new ExprVector(res);
+  }
+
+  const Expr* mutate(const Broadcast* v) override {
+    return new ExprVector(std::vector<const Expr*>(v->lanes(), v->value()));
+  }
+
+  const Expr* mutate(const Load* v) override {
+    std::vector<const ExprVector*> devec_indices(v->indices().size());
+    for (size_t i = 0; i < devec_indices.size(); i++) {
+      devec_indices[i] = devec(v->indices()[i]);
+    }
+    auto devec_mask = devec(v->mask());
+    std::vector<const Expr*> res(devec_indices[0]->size());
+    std::vector<const Expr*> indices(v->indices().size());
+    for (size_t i = 0; i < res.size(); i++) {
+      for (size_t j = 0; j < indices.size(); j++) {
+        indices[j] = (*devec_indices[j])[i];
+      }
+      res[i] = new Load(
+          v->dtype().scalar_dtype(), v->buf(), indices, (*devec_mask)[i]);
+    }
+    return new ExprVector(res);
+  }
+
+  Stmt* mutate(const Store* v) override {
+    std::vector<const ExprVector*> devec_indices(v->indices().size());
+    for (size_t i = 0; i < devec_indices.size(); i++) {
+      devec_indices[i] = devec(v->indices()[i]);
+    }
+    auto devec_mask = devec(v->mask());
+    auto devec_val = devec(v->value());
+    std::vector<const Stmt*> res(devec_indices[0]->size());
+    std::vector<const Expr*> indices(v->indices().size());
+    for (size_t i = 0; i < res.size(); i++) {
+      for (size_t j = 0; j < indices.size(); j++) {
+        indices[j] = (*devec_indices[j])[i];
+      }
+      res[i] = new Store(v->buf(), indices, (*devec_val)[i], (*devec_mask)[i]);
+    }
+    return new StmtVector(res);
+  }
+
+  const Expr* mutate(const Intrinsics* v) override {
+    if (v->nparams() == 0) {
+      return new ExprVector({v});
+    }
+
+    std::vector<const ExprVector*> devec_params(v->nparams());
+    for (size_t i = 0; i < devec_params.size(); i++) {
+      devec_params[i] = devec(v->param(static_cast<int>(i)));
+    }
+
+    std::vector<const Expr*> res(v->param(0)->dtype().lanes());
+    std::vector<const Expr*> params(v->nparams());
+    for (size_t i = 0; i < res.size(); i++) {
+      for (size_t p = 0; p < params.size(); p++) {
+        params[p] = (*devec_params[p])[i];
+      }
+      res[i] = new Intrinsics(v->op_type(), params);
+    }
+    return new ExprVector(res);
+  }
+
+  const Expr* mutate(const Var* v) override {
+    if (vector_vars_.find(v) == vector_vars_.end()) {
+      throw std::runtime_error("Var is not of vector data type");
+    }
+    return vector_vars_.at(v);
+  }
+
+  void devecVar(const Var* v) {
+    vector_vars_[v] = devec(v);
+  }
+
+  const ExprVector* devec(const Expr* v) {
+    return static_cast<const ExprVector*>(v->accept_mutator(this));
+  }
+
+  const StmtVector* devec(const Stmt* v) {
+    return static_cast<const StmtVector*>(
+        const_cast<Stmt*>(v)->accept_mutator(this));
+  }
+
+ private:
+  std::unordered_map<const Var*, const ExprVector*> vector_vars_;
+};
+
+CppPrinter::CppPrinter(std::ostream* os)
+    : IRPrinter(*os), devectorizer_(std::make_unique<Devectorizer>()) {}
+
+CppPrinter::~CppPrinter() = default;
 
 void CppPrinter::printPrologue() {
   os() << "#include <cassert>" << std::endl;
@@ -44,12 +282,6 @@ void CppPrinter::printPrologue() {
 
   os() << "#define POS_INFINITY INFINITY" << std::endl;
   os() << "#define NEG_INFINITY -INFINITY" << std::endl;
-  os() << std::endl;
-
-  os() << cpp_vector_definition << std::endl;
-  os() << std::endl;
-
-  os() << cpp_tensor_definition << std::endl;
   os() << std::endl;
 
   os() << cpp_intrinsics_definition << std::endl;
@@ -80,20 +312,6 @@ std::string CppPrinter::declareExternalFunction(const std::string& func_name) {
       "int8_t* buf_dtypes, "
       "int64_t args_num, "
       "int64_t* extra_args);";
-}
-
-void CppPrinter::visit(const Ramp* v) {
-  const IntImm* base = dynamic_cast<const IntImm*>(v->base());
-  const IntImm* stride = dynamic_cast<const IntImm*>(v->stride());
-  if (base == nullptr || stride == nullptr) {
-    throw std::runtime_error("Ramp only supports IntImm as base and stride");
-  }
-  os() << "Ramp(" << *base << ", " << *stride << ", " << v->lanes() << ")";
-}
-
-void CppPrinter::visit(const Broadcast* v) {
-  os() << "Broadcast<" << v->value()->dtype().ToCppString() << ">("
-       << *v->value() << ", " << v->lanes() << ")";
 }
 
 template <typename T>
@@ -175,53 +393,30 @@ void dispatch_binary_op(std::ostream& os, const BinaryOpNode<Op>* v) {
   }
 }
 
+void CppPrinter::visit(const Ramp* v) {
+  throw unimplemented_lowering(v);
+}
+
+void CppPrinter::visit(const Broadcast* v) {
+  throw unimplemented_lowering(v);
+}
+
 void CppPrinter::visit(const Mod* v) {
-  if (v->lhs()->dtype().lanes() == 1) {
-    dispatch_binary_op(os(), v);
-  } else {
-    os() << *v->lhs() << " % " << *v->rhs();
-  }
+  dispatch_binary_op(os(), v);
 }
 
 void CppPrinter::visit(const Max* v) {
-  if (v->lhs()->dtype().lanes() == 1) {
-    dispatch_binary_op(os(), v);
-  } else {
-    os() << "Max(" << *v->lhs() << ", " << *v->rhs() << ")";
-  }
+  dispatch_binary_op(os(), v);
 }
 
 void CppPrinter::visit(const Min* v) {
-  if (v->lhs()->dtype().lanes() == 1) {
-    dispatch_binary_op(os(), v);
-  } else {
-    os() << "Min(" << *v->lhs() << ", " << *v->rhs() << ")";
-  }
-}
-
-std::string CppPrinter::toLambda(
-    CompareSelectOperation op,
-    const std::string& ty) {
-  std::stringstream ss;
-  ss << "[](" << ty << " lhs, " << ty << " rhs) { "
-     << "return lhs " << to_string(op) << " rhs;"
-     << " }";
-  return ss.str();
+  dispatch_binary_op(os(), v);
 }
 
 void CppPrinter::visit(const CompareSelect* v) {
-  if (v->lhs()->dtype().lanes() == 1) {
-    os() << "((" << *v->lhs() << " "
-         << IRPrinter::to_string(v->compare_select_op()) << " " << *v->rhs()
-         << ") ? " << *v->ret_val1() << " : " << *v->ret_val2() << ")";
-  } else {
-    std::string input_ty = v->lhs()->dtype().ToCppString();
-    std::string return_ty = v->ret_val1()->dtype().ToCppString();
-    os() << "CompareSelect<" << input_ty << ", " << return_ty << ">("
-         << toLambda(v->compare_select_op(), input_ty) << ", " << *v->lhs()
-         << ", " << *v->rhs() << ", " << *v->ret_val1() << ", "
-         << *v->ret_val2() << ")";
-  }
+  os() << "((" << *v->lhs() << " "
+       << IRPrinter::to_string(v->compare_select_op()) << " " << *v->rhs()
+       << ") ? " << *v->ret_val1() << " : " << *v->ret_val2() << ")";
 }
 
 void CppPrinter::visit(const IfThenElse* v) {
@@ -230,74 +425,73 @@ void CppPrinter::visit(const IfThenElse* v) {
 }
 
 void CppPrinter::visit(const Allocate* v) {
-  emitIndent();
-  os() << "Tensor<" << v->dtype().ToCppString() << "> " << *v->buffer_var()
-       << "({";
-  for (size_t i = 0; i < v->dims().size(); i++) {
-    if (i > 0) {
-      os() << ", ";
+  size_t size = v->dtype().byte_size();
+  for (auto dim : v->dims()) {
+    const IntImm* d = dynamic_cast<const IntImm*>(dim);
+    if (d) {
+      size *= d->value();
+    } else {
+      throw std::runtime_error("Only IntImm dimensions are supported for now");
     }
-    os() << *v->dims()[i];
   }
-  os() << "});" << std::endl;
+
+  emitIndent();
+  os() << v->dtype().ToCppString() << "* " << (*v->buffer_var())
+       << " = static_cast<" << v->dtype().ToCppString() << "*>(malloc(" << size
+       << "));" << std::endl;
 }
 
 void CppPrinter::visit(const Free* v) {
   emitIndent();
-  os() << *v->buffer_var() << ".free();" << std::endl;
+  os() << "free(" << *v->buffer_var() << ");" << std::endl;
 }
 
 void CppPrinter::visit(const Load* v) {
-  if (v->indices().size() > 1) {
-    os() << *v->base_handle() << "[{";
-    for (size_t i = 0; i < v->indices().size(); i++) {
-      if (i > 0) {
-        os() << ", ";
-      }
-      os() << *v->indices()[i];
-    }
-    os() << "}]";
-  } else if (v->flat_index()->dtype().lanes() == 1) {
-    os() << *v->base_handle() << "[" << *v->flat_index() << "]";
+  auto flat_idx = flatten_index(v->buf()->dims(), v->indices());
+  const IntImm* m = dynamic_cast<const IntImm*>(v->mask());
+  if (m == nullptr) {
+    os() << "((" << *v->mask() << ") ? " << *v->base_handle() << "["
+         << *flat_idx << "] : 0)";
+  } else if (m->value() == 0) {
+    os() << "0";
   } else {
-    os() << *v->base_handle() << ".load(" << *v->flat_index() << ", "
-         << *v->mask() << ")";
+    os() << *v->base_handle() << "[" << *flat_idx << "]";
   }
 }
 
 void CppPrinter::visit(const Store* v) {
-  emitIndent();
-  if (v->indices().size() > 1) {
-    os() << *v->base_handle() << "[{";
-    for (size_t i = 0; i < v->indices().size(); i++) {
-      if (i > 0) {
-        os() << ", ";
-      }
-      os() << *v->indices()[i];
+  if (v->value()->dtype().lanes() > 1) {
+    const StmtVector* stores = devectorizer_->devec(v);
+    for (size_t i = 0; i < stores->size(); i++) {
+      visit(static_cast<const Store*>((*stores)[i]));
     }
-    os() << "}] = " << *v->value() << ";";
-  } else if (v->flat_index()->dtype().lanes() == 1) {
-    os() << *v->base_handle() << "[" << *v->flat_index()
-         << "] = " << *v->value() << ";";
   } else {
-    os() << *v->base_handle() << ".store(" << *v->flat_index() << ", "
-         << *v->value() << ", " << *v->mask() << ");";
+    auto flat_idx = flatten_index(v->buf()->dims(), v->indices());
+    emitIndent();
+    const IntImm* m = dynamic_cast<const IntImm*>(v->mask());
+    if (m == nullptr) {
+      os() << "if (" << *v->mask() << ") {" << std::endl;
+      indent_++;
+      emitIndent();
+      os() << *v->base_handle() << "[" << *flat_idx << "] = " << *v->value()
+           << ";" << std::endl;
+      indent_--;
+      emitIndent();
+      os() << "}" << std::endl;
+    } else if (m->value() != 0) {
+      os() << *v->base_handle() << "[" << *flat_idx << "] = " << *v->value()
+           << ";" << std::endl;
+    }
   }
-  os() << std::endl;
 }
 
 void CppPrinter::visit(const Cast* v) {
-  if (v->src_value()->dtype().lanes() == 1) {
-    os() << "static_cast<" << v->dtype().ToCppString() << ">("
-         << *v->src_value() << ")";
-  } else {
-    os() << "Cast<" << v->src_value()->dtype().ToCppString() << ", "
-         << v->dtype().ToCppString() << ">(" << *v->src_value() << ")";
-  }
+  os() << "static_cast<" << v->dtype().ToCppString() << ">(" << *v->src_value()
+       << ")";
 }
 
 void CppPrinter::visit(const BitCast* v) {
-  os() << "BitCast<" << v->src_value()->dtype().ToCppString() << ", "
+  os() << "std::bitcast<" << v->src_value()->dtype().ToCppString() << ", "
        << v->dtype().ToCppString() << ">(" << *v->src_value() << ")";
 }
 
@@ -306,35 +500,14 @@ void CppPrinter::visit(const Intrinsics* v) {
     throw std::runtime_error("kRand and kSigmoid are not supported");
   }
 
-  if (v->param(0)->dtype().lanes() == 1) {
-    os() << "std::" << v->func_name() << "(";
-    for (int i = 0; i < v->nparams(); i++) {
-      if (i > 0) {
-        os() << ", ";
-      }
-      os() << *v->param(i);
+  os() << "std::" << v->func_name() << "(";
+  for (int i = 0; i < v->nparams(); i++) {
+    if (i > 0) {
+      os() << ", ";
     }
-    os() << ")";
-  } else {
-    ScalarType ty = v->param(0)->dtype().scalar_type();
-    for (int i = 1; i < v->nparams(); ++i) {
-      ty = promoteTypes(ty, v->param(i)->dtype().scalar_type());
-    }
-    const std::string input_type = Dtype(ty).ToCppString();
-    const std::string ret_type = (v->op_type() == kIsNan)
-        ? "int"
-        : (is_integral(ty) ? "double" : input_type);
-
-    os() << "ComputeIntrinsics<" << input_type << ", " << ret_type << ">(";
-    os() << "std::" << v->func_name() << ", ";
-    for (int i = 0; i < v->nparams(); i++) {
-      if (i > 0) {
-        os() << ", ";
-      }
-      os() << *v->param(i);
-    }
-    os() << ")";
+    os() << *v->param(i);
   }
+  os() << ")";
 }
 
 void CppPrinter::visit(const ExternalCall* v) {
@@ -363,7 +536,7 @@ void CppPrinter::visit(const ExternalCall* v) {
 
   emitIndent();
   os() << "std::vector<void*> buf_ptrs{";
-  for_buf([&](const Buf* b) { os() << *b->base_handle() << ".data()"; });
+  for_buf([&](const Buf* b) { os() << *b->base_handle(); });
   os() << "};" << std::endl;
 
   emitIndent();
@@ -422,6 +595,25 @@ void CppPrinter::visit(const ExternalCall* v) {
   os() << "}" << std::endl;
 }
 
+void CppPrinter::visit(const Let* v) {
+  if (v->dtype().lanes() == 1) {
+    emitIndent();
+    os() << v->dtype().ToCppString() << " " << *v->var() << " = " << *v->value()
+         << ";" << std::endl;
+  } else {
+    devectorizer_->devecVar(v->var());
+  }
+}
+
+CppCodeGen::CppCodeGen(
+    Stmt* stmt,
+    const std::vector<BufferArg>& buffer_args,
+    at::Device device,
+    const std::string& kernel_func_name)
+    : CodeGen(stmt, buffer_args, device, kernel_func_name) {
+  init();
+}
+
 void CppCodeGen::init() {
   printer_ = std::make_unique<CppPrinter>(&oss_);
   var_name_rewriter_ = std::make_unique<CppVarNameRewriter>();
@@ -438,16 +630,14 @@ void CppCodeGen::init() {
     const BufferArg& buffer_arg = buffer_args[i];
     const Var* var = var_name_rewriter_->getNewVar(buffer_arg.var());
     Dtype dtype = buffer_arg.dtype();
-    if (buffer_arg.isVar()) {
-      os() << dtype.ToCppString() << " " << *var;
-    } else {
-      os() << "Tensor<" << dtype.ToCppString() << ">& " << *var;
-    }
+    os() << dtype.ToCppString() << (buffer_arg.isVar() ? " " : "* ") << *var;
   }
   os() << ")";
   stmt()->accept(printer_.get());
   os() << std::endl;
 }
+
+CppCodeGen::~CppCodeGen() = default;
 
 void CppCodeGen::call(const std::vector<CallArg>& args) {
   // TODO: compile the generated C++ kernel into a library,
